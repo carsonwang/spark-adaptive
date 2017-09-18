@@ -26,13 +26,13 @@ import org.apache.spark.MapOutputStatistics
 import org.apache.spark.broadcast
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeMap, Expression, SortOrder}
+import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.physical.{HashPartitioning, Partitioning, UnknownPartitioning}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.command.ExecutedCommandExec
 import org.apache.spark.sql.execution.exchange._
-import org.apache.spark.sql.execution.joins.{BroadcastHashJoinExec, BuildLeft, BuildRight, SortMergeJoinExec}
+import org.apache.spark.sql.execution.joins._
 import org.apache.spark.sql.execution.statsEstimation.Statistics
 import org.apache.spark.sql.execution.ui.SparkListenerSQLAdaptiveExecutionUpdate
 import org.apache.spark.sql.internal.SQLConf
@@ -87,7 +87,7 @@ case class ShuffleQueryStageInput(
     override val output: Seq[Attribute],
     var isLocalShuffle: Boolean = false,
     // TODO refine this later
-    var isAdaptiveShuffle: Boolean = false,
+    var adaptiveShuffleReducerNum: Int = 0,
     var skewedPartitions: Option[mutable.HashSet[Int]] = None,
     var partitionStartIndices: Option[Array[Int]] = None,
     var partitionEndIndices: Option[Array[Int]] = None)
@@ -101,10 +101,17 @@ case class ShuffleQueryStageInput(
     val childRDD = childStage.execute().asInstanceOf[ShuffledRowRDD]
     if (isLocalShuffle) {
       new LocalShuffledRowRDD(childRDD.dependency)
-    } else if (isAdaptiveShuffle) {
+    } else if (adaptiveShuffleReducerNum > 0) {
       assert(partitionStartIndices.isDefined && partitionEndIndices.isDefined &&
         partitionEndIndices.get(0) == partitionStartIndices.get(0) + 1)
-      new AdaptiveShuffledRowRDD(childRDD.dependency, partitionStartIndices.get(0))
+      val totalMapperNum = childRDD.dependency.rdd.partitions.length
+      val reducerNum = Math.min(10, adaptiveShuffleReducerNum)
+      val mapIdStartIndices = Array.tabulate[Int](reducerNum) { i =>
+        i * totalMapperNum / reducerNum}
+      new AdaptiveShuffledRowRDD(
+        childRDD.dependency,
+        partitionStartIndices.get(0),
+        Some(mapIdStartIndices))
     } else {
       new ShuffledRowRDD(childRDD.dependency, partitionStartIndices, partitionEndIndices)
     }
@@ -416,7 +423,7 @@ case class HandleSkewedJoin(conf: SQLConf) extends Rule[SparkPlan] {
    * the median row count * spark.sql.adaptive.skewedPartitionFactor and also larger than
    * spark.sql.adaptive.skewedPartitionSizeThreshold.
    */
-  private def skewedPartitions(plan: QueryStage): Seq[Int] = {
+  private def skewedPartitions(plan: QueryStage): Array[(Int, Int)] = {
     plan.stats.partStatistics match {
       case Some(partitionStats) =>
         val bytesByPartitionId = partitionStats.bytesByPartitionId
@@ -426,15 +433,20 @@ case class HandleSkewedJoin(conf: SQLConf) extends Rule[SparkPlan] {
         val medianPartitionSize = sortedBytesByPartitionId(bytesByPartitionId.length / 2)
         val medianRowCount = sortedRowsByPartitionId(rowsByPartitionId.length / 2)
 
-        val skewedPartitions = new ArrayBuffer[Int]()
+        val skewedPartitions = new ArrayBuffer[(Int, Int)]()
         for (i <- 0 until bytesByPartitionId.length) {
           if (isSizeSkewed(bytesByPartitionId(i), medianPartitionSize) ||
             isRowCountSkewed(rowsByPartitionId(i), medianRowCount)) {
-            skewedPartitions += i
+            val times = Math.max(
+              bytesByPartitionId(i) / medianPartitionSize,
+              rowsByPartitionId(i) / medianRowCount)
+            skewedPartitions += ((i, times.toInt + 1))
           }
         }
-        skewedPartitions.toArray
-      case None => Seq.empty[Int]
+        // skewedPartitions.toArray
+        // TODO only take first 1 for test.
+        skewedPartitions.toArray.take(1)
+      case None => Array.empty[(Int, Int)]
     }
   }
 
@@ -447,6 +459,24 @@ case class HandleSkewedJoin(conf: SQLConf) extends Rule[SparkPlan] {
     }
   }
 
+  /**
+   * A SortMergeJoin extracts the equi-join keys from the original join condition. This method
+   * returns the original join condition based on the extracted equi-join keys and other optional
+   * condition.
+   */
+  private def getEquiJoinCondition(
+      leftKeys: Seq[Expression],
+      rightKeys: Seq[Expression],
+      otherCondition: Option[Expression]) : Expression = {
+    val equalExprs = leftKeys.zip(rightKeys).map { case (l, r) => EqualTo(l, r) }
+    val equalConds = equalExprs.reduce(And)
+    val combinedCondition = otherCondition match {
+      case Some(cond) => And(equalConds, cond)
+      case None => equalConds
+    }
+    combinedCondition
+  }
+
   private def handleSkewedJoin(
       operator: SparkPlan,
       queryStage: QueryStage): SparkPlan = operator.transformUp {
@@ -457,44 +487,59 @@ case class HandleSkewedJoin(conf: SQLConf) extends Rule[SparkPlan] {
       val skewedPartitionsInRight = skewedPartitions(right.childStage)
       val handledPartitions = mutable.HashSet[Int]()
       val subJoins = mutable.ArrayBuffer[SparkPlan](smj)
-      skewedPartitionsInLeft.foreach { p =>
+      skewedPartitionsInLeft.foreach { case (p ,n) =>
+        val leftInput =
+          ShuffleQueryStageInput(
+            left.childStage,
+            left.output,
+            adaptiveShuffleReducerNum = n,
+            partitionStartIndices = Some(Array(p)),
+            partitionEndIndices = Some(Array(p + 1)))
+        val rightInput =
+          ShuffleQueryStageInput(
+            right.childStage,
+            right.output,
+            adaptiveShuffleReducerNum = n,
+            partitionStartIndices = Some(Array(p)),
+            partitionEndIndices = Some(Array(p + 1)))
         if (canBroadcast(right, p)) {
-          handledPartitions += p
-          val leftInput =
-            ShuffleQueryStageInput(
-              left.childStage,
-              left.output,
-              isAdaptiveShuffle = true,
-              partitionStartIndices = Some(Array(p)),
-              partitionEndIndices = Some(Array(p + 1)))
-          val rightInput =
-            ShuffleQueryStageInput(
-              right.childStage,
-              right.output,
-              isAdaptiveShuffle = true,
-              partitionStartIndices = Some(Array(p)),
-              partitionEndIndices = Some(Array(p + 1)))
           subJoins += BroadcastHashJoinExec(
             leftKeys, rightKeys, joinType, joins.BuildRight, condition, leftInput, rightInput)
         }
+        else if (joinType == Inner || joinType == Cross || joinType == LeftSemi) {
+          // TODO only support inner join and left semi in adaptive cartesian for now
+          val joinCondition = getEquiJoinCondition(leftKeys, rightKeys, condition)
+          subJoins +=
+            AdaptiveCartesianProductExec(leftInput, rightInput, joinType, Some(joinCondition))
+        }
+        handledPartitions += p
       }
-      skewedPartitionsInRight.foreach { p =>
-        if (!handledPartitions.contains(p) && canBroadcast(left, p)) {
-          handledPartitions += p
+      skewedPartitionsInRight.foreach { case (p ,n) =>
+        if (!handledPartitions.contains(p)) {
           val leftInput =
             ShuffleQueryStageInput(
               left.childStage,
               left.output,
+              adaptiveShuffleReducerNum = n,
               partitionStartIndices = Some(Array(p)),
               partitionEndIndices = Some(Array(p + 1)))
           val rightInput =
             ShuffleQueryStageInput(
               right.childStage,
               right.output,
+              adaptiveShuffleReducerNum = n,
               partitionStartIndices = Some(Array(p)),
               partitionEndIndices = Some(Array(p + 1)))
-          subJoins += BroadcastHashJoinExec(
-            leftKeys, rightKeys, joinType, joins.BuildLeft, condition, leftInput, rightInput)
+          if (canBroadcast(left, p)) {
+            subJoins += BroadcastHashJoinExec(
+              leftKeys, rightKeys, joinType, joins.BuildLeft, condition, leftInput, rightInput)
+          } else if (joinType == Inner || joinType == Cross || joinType == LeftSemi) {
+            // TODO only support inner join and left semi in adaptive cartesian for now
+            val joinCondition = getEquiJoinCondition(leftKeys, rightKeys, condition)
+            subJoins +=
+              AdaptiveCartesianProductExec(leftInput, rightInput, joinType, Some(joinCondition))
+          }
+          handledPartitions += p
         }
       }
       if (handledPartitions.size > 0) {

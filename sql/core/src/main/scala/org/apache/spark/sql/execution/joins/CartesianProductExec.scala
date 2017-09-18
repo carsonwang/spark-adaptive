@@ -22,6 +22,7 @@ import org.apache.spark.rdd.{CartesianPartition, CartesianRDD, RDD}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, Expression, JoinedRow, UnsafeRow}
 import org.apache.spark.sql.catalyst.expressions.codegen.GenerateUnsafeRowJoiner
+import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.execution.{BinaryExecNode, ExternalAppendOnlyUnsafeRowArray, SparkPlan}
 import org.apache.spark.sql.execution.metric.SQLMetrics
 import org.apache.spark.util.CompletionIterator
@@ -90,6 +91,66 @@ case class CartesianProductExec(
       filtered.map { r =>
         numOutputRows += 1
         joiner.join(r._1, r._2)
+      }
+    }
+  }
+}
+
+case class AdaptiveCartesianProductExec(
+    left: SparkPlan,
+    right: SparkPlan,
+    joinType: JoinType,
+    condition: Option[Expression]) extends BinaryExecNode {
+
+  override def output: Seq[Attribute] = {
+    joinType match {
+      case _: InnerLike =>
+        left.output ++ right.output
+      case LeftSemi =>
+        left.output
+      case x =>
+        throw new IllegalArgumentException(
+          s"${getClass.getSimpleName} should not take $x as the JoinType")
+    }
+  }
+
+  override lazy val metrics = Map(
+    "numOutputRows" -> SQLMetrics.createMetric(sparkContext, "number of output rows"))
+
+  protected override def doExecute(): RDD[InternalRow] = {
+    val numOutputRows = longMetric("numOutputRows")
+
+    val leftResults = left.execute().asInstanceOf[RDD[UnsafeRow]]
+    val rightResults = right.execute().asInstanceOf[RDD[UnsafeRow]]
+
+    val spillThreshold = sqlContext.conf.cartesianProductExecBufferSpillThreshold
+
+    val pair = new UnsafeCartesianRDD(leftResults, rightResults, right.output.size, spillThreshold)
+    pair.mapPartitionsWithIndexInternal { (index, iter) =>
+      val joiner = GenerateUnsafeRowJoiner.create(left.schema, right.schema)
+      val filtered = if (condition.isDefined) {
+        val boundCondition = newPredicate(condition.get, left.output ++ right.output)
+        boundCondition.initialize(index)
+        val joined = new JoinedRow
+
+        iter.filter { r =>
+          boundCondition.eval(joined(r._1, r._2))
+        }
+      } else {
+        iter
+      }
+
+      joinType match {
+        case _: InnerLike =>
+          filtered.map { r =>
+            numOutputRows += 1
+            joiner.join(r._1, r._2)
+          }
+        case LeftSemi =>
+          filtered.map { r =>
+            numOutputRows += 1
+            r._1
+          }
       }
     }
   }
