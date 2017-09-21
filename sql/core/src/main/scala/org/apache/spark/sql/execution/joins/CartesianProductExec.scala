@@ -56,7 +56,6 @@ class UnsafeCartesianRDD(
   }
 }
 
-
 case class CartesianProductExec(
     left: SparkPlan,
     right: SparkPlan,

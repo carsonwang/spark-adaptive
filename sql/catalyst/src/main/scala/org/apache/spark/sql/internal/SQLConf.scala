@@ -231,7 +231,7 @@ object SQLConf {
       "factor multiple the median row count and also larger than " +
       "spark.sql.adaptive.skewedPartitionSizeThreshold.")
     .intConf
-    .createWithDefault(5)
+    .createWithDefault(10)
 
   val ADAPTIVE_EXECUTION_SKEWED_PARTITION_SIZE_THRESHOLD =
     buildConf("spark.sql.adaptive.skewedPartitionSizeThreshold")
