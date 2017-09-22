@@ -221,7 +221,7 @@ object SQLConf {
     .doc("When true and adaptive execution is enabled, a skewed join is automatically handled at " +
       "runtime.")
     .booleanConf
-    .createWithDefault(true)
+    .createWithDefault(false)
 
   val ADAPTIVE_EXECUTION_SKEWED_PARTITION_FACTOR =
     buildConf("spark.sql.adaptive.skewedPartitionFactor")
