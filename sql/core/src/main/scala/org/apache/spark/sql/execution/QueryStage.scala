@@ -22,8 +22,7 @@ import java.util.concurrent.Future
 import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 
-import org.apache.spark.MapOutputStatistics
-import org.apache.spark.broadcast
+import org.apache.spark.{broadcast, MapOutputStatistics}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeMap, Expression, SortOrder}
@@ -100,7 +99,7 @@ case class ShuffleQueryStageInput(
   override def doExecute(): RDD[InternalRow] = {
     val childRDD = childStage.execute().asInstanceOf[ShuffledRowRDD]
     if (isLocalShuffle) {
-      new LocalShuffledRowRDD(childRDD.dependency)
+      new LocalShuffledRowRDD(childRDD.dependency, partitionStartIndices, partitionEndIndices)
     } else if (isAdaptiveShuffle) {
       assert(partitionStartIndices.isDefined && partitionEndIndices.isDefined &&
         partitionEndIndices.get(0) == partitionStartIndices.get(0) + 1)
@@ -182,68 +181,83 @@ abstract class QueryStage extends UnaryExecNode {
 
   def executeStage(): RDD[InternalRow] = child.execute()
 
-  private var cachedRDD: RDD[InternalRow] = null
+  private var cachedRDD: Option[RDD[InternalRow]] = None
+  private var cachedArray: Option[Array[InternalRow]] = None
+
+  def doPreExecutionOptimization(): Unit = {
+    // 1. Execute childStages and optimize the plan in this stage
+    executeChildStages()
+
+    // Optimize join in this stage based on previous stages' statistics.
+    val oldChild = child
+    OptimizeJoin(conf).apply(this)
+    HandleSkewedJoin(conf).apply(this)
+    // If the Joins are changed, we need apply EnsureRequirements rule to add BroadcastExchange.
+    if (!oldChild.fastEquals(child)) {
+      child = EnsureRequirements(conf).apply(child)
+    }
+
+    // 2. Determine reducer number
+    val queryStageInputs: Seq[ShuffleQueryStageInput] = child.collect {
+      case input: ShuffleQueryStageInput if (!input.partitionStartIndices.isDefined) => input
+    }
+    val childMapOutputStatistics = queryStageInputs.map(_.childStage.mapOutputStatistics)
+      .filter(_ != null).toArray
+    if (childMapOutputStatistics.length > 0) {
+      val minNumPostShufflePartitions =
+        if (conf.minNumPostShufflePartitions > 0) Some(conf.minNumPostShufflePartitions) else None
+
+      val exchangeCoordinator = new ExchangeCoordinator(
+        conf.targetPostShuffleInputSize,
+        minNumPostShufflePartitions)
+
+      if (queryStageInputs.length == 2 && queryStageInputs.forall(_.skewedPartitions.isDefined)) {
+        // If a skewed join is detected and optimized, we will omit the skewed partitions when
+        // estimate the partition start and end indices.
+        val (partitionStartIndices, partitionEndIndices) =
+          exchangeCoordinator.estimatePartitionStartEndIndices(
+            childMapOutputStatistics, queryStageInputs(0).skewedPartitions.get)
+        queryStageInputs.foreach { i =>
+          i.partitionStartIndices = Some(partitionStartIndices)
+          i.partitionEndIndices = Some(partitionEndIndices)
+        }
+      } else {
+        val partitionStartIndices =
+          exchangeCoordinator.estimatePartitionStartIndices(childMapOutputStatistics)
+        queryStageInputs.foreach(_.partitionStartIndices = Some(partitionStartIndices))
+      }
+    }
+
+    // 3. Codegen and update the UI
+    child = CollapseCodegenStages(sqlContext.conf).apply(child)
+    val executionId = sqlContext.sparkContext.getLocalProperty(SQLExecution.EXECUTION_ID_KEY)
+    if (executionId != null && executionId.nonEmpty) {
+      val queryExecution = SQLExecution.getQueryExecution(executionId.toLong)
+      sparkContext.listenerBus.post(SparkListenerSQLAdaptiveExecutionUpdate(
+        executionId.toLong,
+        queryExecution.toString,
+        SparkPlanInfo.fromSparkPlan(queryExecution.executedPlan)))
+    }
+  }
 
   override def doExecute(): RDD[InternalRow] = synchronized {
-    if (cachedRDD == null) {
-      // 1. Execute childStages and optimize the plan in this stage
-      executeChildStages()
-
-      // Optimize join in this stage based on previous stages' statistics.
-      val oldChild = child
-      OptimizeJoin(conf).apply(this)
-      HandleSkewedJoin(conf).apply(this)
-      // If the Joins are changed, we need apply EnsureRequirements rule to add BroadcastExchange.
-      if (!oldChild.fastEquals(child)) {
-        child = EnsureRequirements(conf).apply(child)
-      }
-
-      // 2. Determine reducer number
-      val queryStageInputs: Seq[ShuffleQueryStageInput] = child.collect {
-        case input: ShuffleQueryStageInput if (!input.partitionStartIndices.isDefined) => input
-      }
-      val childMapOutputStatistics = queryStageInputs.map(_.childStage.mapOutputStatistics)
-        .filter(_ != null).toArray
-      if (childMapOutputStatistics.length > 0) {
-        val minNumPostShufflePartitions =
-          if (conf.minNumPostShufflePartitions > 0) Some(conf.minNumPostShufflePartitions) else None
-
-        val exchangeCoordinator = new ExchangeCoordinator(
-          conf.targetPostShuffleInputSize,
-          minNumPostShufflePartitions)
-
-        if (queryStageInputs.length == 2 && queryStageInputs.forall(_.skewedPartitions.isDefined)) {
-          // If a skewed join is detected and optimized, we will omit the skewed partitions when
-          // estimate the partition start and end indices.
-          val (partitionStartIndices, partitionEndIndices) =
-            exchangeCoordinator.estimatePartitionStartEndIndices(
-              childMapOutputStatistics, queryStageInputs(0).skewedPartitions.get)
-          queryStageInputs.foreach { i =>
-            i.partitionStartIndices = Some(partitionStartIndices)
-            i.partitionEndIndices = Some(partitionEndIndices)
-          }
-        } else {
-          val partitionStartIndices =
-            exchangeCoordinator.estimatePartitionStartIndices(childMapOutputStatistics)
-        queryStageInputs.foreach(_.partitionStartIndices = Some(partitionStartIndices))
-        }
-      }
-
-      // 3. Codegen and update the UI
-      child = CollapseCodegenStages(sqlContext.conf).apply(child)
-      val executionId = sqlContext.sparkContext.getLocalProperty(SQLExecution.EXECUTION_ID_KEY)
-      if (executionId != null && executionId.nonEmpty) {
-        val queryExecution = SQLExecution.getQueryExecution(executionId.toLong)
-        sparkContext.listenerBus.post(SparkListenerSQLAdaptiveExecutionUpdate(
-          executionId.toLong,
-          queryExecution.toString,
-          SparkPlanInfo.fromSparkPlan(queryExecution.executedPlan)))
-      }
-
-      // 4. Execute the plan in this stage
-      cachedRDD = executeStage()
+    cachedRDD match {
+      case None =>
+        doPreExecutionOptimization()
+        cachedRDD = Some(executeStage())
+      case Some(cached) =>
     }
-    cachedRDD
+    cachedRDD.get
+  }
+
+  override def executeCollect(): Array[InternalRow] = synchronized {
+    cachedArray match {
+      case None =>
+        doPreExecutionOptimization()
+        cachedArray = Some(child.executeCollect())
+      case Some(cached) =>
+    }
+    cachedArray.get
   }
 
   override def generateTreeString(
@@ -324,6 +338,51 @@ case class OptimizeJoin(conf: SQLConf) extends Rule[SparkPlan] {
     }
   }
 
+  private[execution] def calculatePartitionStartEndIndices(rowStatisticsByPartitionId: Array[Long]):
+    (Array[Int], Array[Int]) = {
+    val partitionStartIndicies = ArrayBuffer[Int]()
+    val partitionEndIndicies = ArrayBuffer[Int]()
+    var continuousZeroFlag = false
+    var i = 0
+    for (rows <- rowStatisticsByPartitionId) {
+      if (rows != 0 && !continuousZeroFlag) {
+        partitionStartIndicies += i
+        continuousZeroFlag = true
+      } else if (rows == 0 && continuousZeroFlag) {
+        partitionEndIndicies += i
+        continuousZeroFlag = false
+      }
+      i += 1
+    }
+    if (continuousZeroFlag) {
+      partitionEndIndicies += i
+    }
+    if (partitionStartIndicies.length == 0) {
+      (Array(0), Array(0))
+    } else {
+      (partitionStartIndicies.toArray, partitionEndIndicies.toArray)
+    }
+  }
+
+  // After transforming to BroadcastJoin from SortMergeJoin, local shuffle read should be used and
+  // there's opportunity to read less partitions based on previous shuffle write results
+  private def optimizeForLocalShuffleReadLessPartitions(
+    broadcastSidePlan: SparkPlan, childrenPlans: Seq[SparkPlan]) = {
+    broadcastSidePlan match {
+      case broadcast: ShuffleQueryStageInput =>
+        val (startIndicies, endIndicies) = calculatePartitionStartEndIndices(broadcast.childStage
+          .stats.partStatistics.get.rowsByPartitionId)
+        childrenPlans.foreach {
+          case input: ShuffleQueryStageInput =>
+            input.isLocalShuffle = true
+            input.partitionStartIndices = Some(startIndicies)
+            input.partitionEndIndices = Some(endIndicies)
+          case _ =>
+        }
+      case _ =>
+    }
+  }
+
   private def optimizeSortMergeJoin(
       smj: SortMergeJoinExec,
       queryStage: QueryStage): SparkPlan = {
@@ -353,11 +412,14 @@ case class OptimizeJoin(conf: SQLConf) extends Rule[SparkPlan] {
 
         if ((numExchanges == 0) ||
           (queryStage.isInstanceOf[ShuffleQueryStage] && numExchanges <= 1)) {
-          // Set QueryStageInput to return local shuffled RDD
-          broadcastJoin.children.foreach {
-            case input: ShuffleQueryStageInput => input.isLocalShuffle = true
-            case _ =>
+          val broadcastSidePlan = buildSide match {
+            case BuildLeft => (removeSort(left))
+            case BuildRight => (removeSort(right))
           }
+
+          // Local shuffle read less partitions based on broadcastSide's row statistics
+          optimizeForLocalShuffleReadLessPartitions(broadcastSidePlan, broadcastJoin.children)
+
           // Update the plan in queryStage
           queryStage.child = newChild
           broadcastJoin
