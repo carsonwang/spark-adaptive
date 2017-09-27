@@ -86,10 +86,11 @@ class AdaptiveShuffledRowRDD(
 
   override def compute(split: Partition, context: TaskContext): Iterator[InternalRow] = {
     val shuffledRowPartition = split.asInstanceOf[AdaptiveShuffledRowRDDPartition]
+    val index = shuffledRowPartition.preShufflePartitionIndex
     val reader = SparkEnv.get.shuffleManager.getReader(
       dependency.shuffleHandle,
-      shuffledRowPartition.preShufflePartitionIndex,
-      shuffledRowPartition.preShufflePartitionIndex + 1,
+      index,
+      index + 1,
       context,
       shuffledRowPartition.startMapId,
       shuffledRowPartition.endMapId)
