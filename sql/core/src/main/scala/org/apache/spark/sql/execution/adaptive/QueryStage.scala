@@ -31,6 +31,10 @@ import org.apache.spark.sql.execution.exchange._
 import org.apache.spark.sql.execution.ui.SparkListenerSQLAdaptiveExecutionUpdate
 import org.apache.spark.util.ThreadUtils
 
+/**
+ * In adaptive execution mode, an execution plan is divided into multiple QueryStages. Each
+ * QueryStage is a sub tree that runs in a single stage.
+ */
 abstract class QueryStage extends UnaryExecNode {
 
   var child: SparkPlan
@@ -184,8 +188,10 @@ object QueryStage {
     ThreadUtils.newDaemonCachedThreadPool("adaptive-query-stage-pool")
 }
 
+/** The last QueryStage of an execution plan. */
 case class ResultQueryStage(var child: SparkPlan) extends QueryStage
 
+/** A shuffle QueryStage whose child is a ShuffleExchange. */
 case class ShuffleQueryStage(var child: SparkPlan) extends QueryStage {
   override def executeStage(): RDD[InternalRow] = {
     child match {
@@ -199,6 +205,7 @@ case class ShuffleQueryStage(var child: SparkPlan) extends QueryStage {
   }
 }
 
+/** A broadcast QueryStage whose child is a BroadcastExchangeExec. */
 case class BroadcastQueryStage(var child: SparkPlan) extends QueryStage {
   override def doExecuteBroadcast[T](): broadcast.Broadcast[T] = {
     child.executeBroadcast()

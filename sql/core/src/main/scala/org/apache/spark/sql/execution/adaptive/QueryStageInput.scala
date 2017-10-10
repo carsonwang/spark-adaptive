@@ -70,6 +70,7 @@ abstract class QueryStageInput extends LeafExecNode {
   }
 }
 
+/** A QueryStageInput whose child stage is a ShuffleQueryStage. */
 case class ShuffleQueryStageInput(
     childStage: QueryStage,
     override val output: Seq[Attribute],
@@ -120,6 +121,7 @@ case class SkewedShuffleQueryStageInput(
   }
 }
 
+/** A QueryStageInput whose child stage is a BroadcastQueryStage. */
 case class BroadcastQueryStageInput(
     childStage: QueryStage,
     override val output: Seq[Attribute])
