@@ -25,7 +25,7 @@ import scala.collection.mutable.ArrayBuffer
 import org.roaringbitmap.RoaringBitmap
 
 import org.apache.spark.SparkEnv
-import org.apache.spark.internal.config
+import org.apache.spark.internal.{Logging, config}
 import org.apache.spark.storage.BlockManagerId
 import org.apache.spark.util.Utils
 
@@ -53,7 +53,10 @@ private[spark] object MapStatus {
 
   def apply(loc: BlockManagerId,
     uncompressedSizes: Array[Long], uncompressedRows: Array[Long]): MapStatus = {
-    if (uncompressedSizes.length > 2000) {
+    val threshold = Option(SparkEnv.get)
+      .map(_.conf.get(config.SHUFFLE_HIGHLY_COMPRESSED_MAP_STATUS_THRESHOLD))
+      .getOrElse(config.SHUFFLE_HIGHLY_COMPRESSED_MAP_STATUS_THRESHOLD.defaultValue.get)
+    if (uncompressedSizes.length > threshold) {
       HighlyCompressedMapStatus(loc, uncompressedSizes, uncompressedRows)
     } else {
       new CompressedMapStatus(loc, uncompressedSizes, uncompressedRows)
@@ -235,7 +238,7 @@ private[spark] class HighlyCompressedMapStatus private (
   }
 }
 
-private[spark] object HighlyCompressedMapStatus {
+private[spark] object HighlyCompressedMapStatus extends Logging {
   def apply(loc: BlockManagerId,
     uncompressedSizes: Array[Long], uncompressedRows: Array[Long]): HighlyCompressedMapStatus = {
     // We must keep track of which blocks are empty so that we don't report a zero-sized
@@ -291,6 +294,9 @@ private[spark] object HighlyCompressedMapStatus {
     }
     emptyBlocks.trim()
     emptyBlocks.runOptimize()
+    logInfo(s"HighlyCompressedMapStatus, nonEmpty:$numNonEmptyBlocks, hugeBlock:" +
+      s"${hugeBlockSizesArray.size} avgSize $avgSize hugeRow ${hugeBlockRowsArray.size} " +
+      s"avgRow $avgRow ")
     new HighlyCompressedMapStatus(loc, numNonEmptyBlocks, emptyBlocks, avgSize,
       hugeBlockSizesArray.toMap, avgRow, hugeBlockRowsArray.toMap)
   }
