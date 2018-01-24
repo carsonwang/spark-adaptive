@@ -33,7 +33,7 @@ import org.apache.spark.util.ThreadUtils
 
 /**
  * In adaptive execution mode, an execution plan is divided into multiple QueryStages. Each
- * QueryStage is a sub tree that runs in a single stage.
+ * QueryStage is a sub-tree that runs in a single stage.
  */
 abstract class QueryStage extends UnaryExecNode {
 
