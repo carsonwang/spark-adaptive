@@ -347,14 +347,14 @@ class QueryStageSuite extends SparkFunSuite with BeforeAndAfterAll {
       val df2 = df1.repartition(col("id"))
       assert(df2.collect().length == 105)
 
-      val siAfterExecution = df2.queryExecution.executedPlan.collect {
-        case si: ShuffleQueryStageInput => si
+      val queryStageInputs = df2.queryExecution.executedPlan.collect {
+        case queryStageInput: ShuffleQueryStageInput => queryStageInput
       }
-      assert(siAfterExecution.length === 1)
+      assert(queryStageInputs.length === 1)
 
       // MapStatus uses log base 1.1 on records to compress,
       // after decompressing, it becomes to 106
-      val stats = siAfterExecution.head.childStage.mapOutputStatistics
+      val stats = queryStageInputs.head.childStage.mapOutputStatistics
       assert(stats.recordsByPartitionId.count(_ == 106) == 1)
     }
   }
@@ -373,14 +373,14 @@ class QueryStageSuite extends SparkFunSuite with BeforeAndAfterAll {
       val df2 = df1.repartition(col("id"))
       assert(df2.collect().length == 105)
 
-      val siAfterExecution = df2.queryExecution.executedPlan.collect {
-        case si: ShuffleQueryStageInput => si
+      val queryStageInputs = df2.queryExecution.executedPlan.collect {
+        case queryStageInput: ShuffleQueryStageInput => queryStageInput
       }
-      assert(siAfterExecution.length === 1)
+      assert(queryStageInputs.length === 1)
 
       // MapStatus uses log base 1.1 on records to compress,
       // after decompressing, it becomes to 106
-      val stats = siAfterExecution.head.childStage.mapOutputStatistics
+      val stats = queryStageInputs.head.childStage.mapOutputStatistics
       assert(stats.recordsByPartitionId.count(_ == 106) == 1)
     }
   }
@@ -397,12 +397,12 @@ class QueryStageSuite extends SparkFunSuite with BeforeAndAfterAll {
       val df2 = df1.repartition(col("id"))
       assert(df2.collect().length == 105)
 
-      val siAfterExecution = df2.queryExecution.executedPlan.collect {
-        case si: ShuffleQueryStageInput => si
+      val queryStageInputs = df2.queryExecution.executedPlan.collect {
+        case queryStageInput: ShuffleQueryStageInput => queryStageInput
       }
-      assert(siAfterExecution.length === 1)
+      assert(queryStageInputs.length === 1)
 
-      val stats = siAfterExecution.head.childStage.mapOutputStatistics
+      val stats = queryStageInputs.head.childStage.mapOutputStatistics
       assert(stats.recordsByPartitionId.isEmpty)
     }
   }
@@ -439,6 +439,24 @@ class QueryStageSuite extends SparkFunSuite with BeforeAndAfterAll {
         assert(resultStart.deep == expectStart.deep)
         assert(resultEnd.deep == expectEnd.deep)
       case _ =>
+    }
+  }
+
+  test("equally divide mappers in skewed partition") {
+    val handleSkewedJoin = HandleSkewedJoin(defaultSparkSession().sqlContext.conf)
+    val cases = Seq((0, 5), (4, 5), (15, 5), (16, 5), (17, 5), (18, 5), (19, 5), (20, 5))
+    val expects = Seq(
+      Seq(0, 0, 0, 0, 0),
+      Seq(0, 1, 2, 3, 4),
+      Seq(0, 3, 6, 9, 12),
+      Seq(0, 4, 7, 10, 13),
+      Seq(0, 4, 8, 11, 14),
+      Seq(0, 4, 8, 12, 15),
+      Seq(0, 4, 8, 12, 16),
+      Seq(0, 4, 8, 12, 16))
+    cases.zip(expects).foreach { case ((numElements, numBuckets), expect) =>
+      val answer = handleSkewedJoin.equallyDivide(numElements, numBuckets)
+      assert(answer === expect)
     }
   }
 }
